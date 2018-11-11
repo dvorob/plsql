@@ -1,0 +1,192 @@
+CREATE OR REPLACE PACKAGE SCHEDULER AS
+  
+  PROCEDURE EXECUTOR;
+  
+  PROCEDURE JOB_CREATE(
+              V_REPORT_TIME   IN DATE, 
+              V_REPORT_NAME   IN VARCHAR2,
+              V_JOB_PREFIX    IN VARCHAR2,
+              V_CALLED_PROC   IN VARCHAR2, 
+              V_STATUS        IN VARCHAR2, 
+              V_START_TIME    IN DATE, 
+              V_STOP_TIME     IN DATE,
+              V_EXEC_STRING   IN VARCHAR2,
+              V_COMMENTS      IN VARCHAR2,
+              V_FLAG          IN NUMBER
+  );
+                        
+  PROCEDURE FULLFILL_TASK;
+  
+  FUNCTION CHECK_STATUS(
+              V_REPORT_NAME  IN VARCHAR2,
+              V_REPORT_START IN DATE,
+              V_REPORT_END   IN DATE
+  ) RETURN NUMBER;
+  
+    FUNCTION CHECK_STATUS_COUNT (
+              V_REPORT_NAME  IN VARCHAR2,
+              V_REPORT_START IN DATE,
+              V_REPORT_END   IN DATE,
+              V_STATUS       IN VARCHAR2
+  ) RETURN NUMBER;
+  
+END SCHEDULER;
+
+
+CREATE OR REPLACE PACKAGE BODY SCHEDULER AS
+
+--------------------------------------------------------------------------------
+--                     Executing jobs from cem_task
+--------------------------------------------------------------------------------
+  PROCEDURE executor AS
+    sql_text VARCHAR2(1000);
+    v_jobs_cnt NUMBER;
+  BEGIN
+    EXECUTE IMMEDIATE 'alter session set nls_date_format=''dd-mm-yyyy hh24:mi'' ';
+    dbms_output.enable(buffer_size => NULL);
+    -- Build a table with one job for each type and READY state
+    FOR tbls IN
+    (  
+        SELECT * FROM (
+          SELECT ta.*, row_number() OVER (PARTITION BY report_name ORDER BY report_time ASC) rn, tb.session_id FROM cem_task ta 
+            LEFT JOIN all_scheduler_running_jobs tb
+            ON ta.job_prefix = SUBSTR(tb.job_name, 1, LENGTH(ta.job_prefix))
+          WHERE ta.status='READY'  
+        ) WHERE rn = 1
+            AND session_id IS NULL -- First check similar jobs are running
+    )
+    LOOP -- Looping this table 
+      SELECT COUNT(*) INTO v_jobs_cnt FROM all_scheduler_running_jobs jobs WHERE jobs.job_name LIKE tbls.job_prefix || '%';
+      -- Second check for running job of same type (paranoid)
+      IF v_jobs_cnt = 0 THEN
+        UPDATE cem_task set status='ACTIVE' where report_id = tbls.report_id;
+        COMMIT;
+        
+        dbms_scheduler.create_job(
+            job_name => tbls.job_prefix || TO_CHAR(tbls.report_id),
+            job_type => 'PLSQL_BLOCK',
+            job_action => 'BEGIN ' || tbls.exec_string || '; UPDATE main.cem_task SET status=''DONE'' WHERE report_id=' || tbls.report_id || '; COMMIT; END;',
+            comments => 'CEM task report: ' || tbls.report_id,
+            enabled => true,
+            auto_drop => true);
+      END IF;
+      v_jobs_cnt := 0;
+    END LOOP;
+    
+    -- After all jobs have running, check for failed scheduling and actualize their states
+    FOR states IN 
+    (
+      SELECT jobs.* FROM main.cem_task ct, all_scheduler_job_run_details jobs 
+      WHERE jobs.job_name = ct.job_prefix || TO_CHAR(ct.report_id)
+        AND ct.status = 'ACTIVE'
+    ) LOOP
+      UPDATE main.cem_task ct
+        SET ct.status = DECODE(states.status, 'FAILED', 'FAILED', 'SUCCEDED', 'DONE', states.status)
+        WHERE states.job_name = ct.job_prefix || TO_CHAR(ct.report_id);
+      COMMIT;
+    END LOOP; 
+  END executor;
+  
+--============================================================================--
+
+--------------------------------------------------------------------------------
+--                           Create a new job
+--------------------------------------------------------------------------------
+    PROCEDURE     JOB_CREATE (
+              V_REPORT_TIME DATE, 
+              V_REPORT_NAME IN VARCHAR2,
+              V_JOB_PREFIX IN VARCHAR2,
+              V_CALLED_PROC IN VARCHAR2, 
+              V_STATUS IN VARCHAR2, 
+              V_START_TIME DATE, 
+              V_STOP_TIME DATE,
+              V_EXEC_STRING IN VARCHAR2,
+              V_COMMENTS IN VARCHAR2,
+              V_FLAG IN NUMBER
+              ) AS
+      sql_text VARCHAR2(2000);
+  BEGIN
+    DBMS_OUTPUT.ENABLE (buffer_size => NULL);
+    sql_text := 'alter session set nls_date_format = ''dd.mm.yyyy hh24:mi:ss''';
+    EXECUTE IMMEDIATE sql_text;
+    sql_text := q'[
+         INSERT INTO main.cem_task ct
+          VALUES (']'|| V_REPORT_TIME || ''', '''
+                     || V_REPORT_NAME || ''', '''       
+                     || V_JOB_PREFIX || ''', '''
+                     || V_CALLED_PROC || ''', '''
+                     || V_STATUS || ''', '''   
+                     || V_START_TIME || ''', '''
+                     || V_STOP_TIME || ''', '''
+                     || V_EXEC_STRING || ''', '''
+                     || V_COMMENTS || ''', '''
+                     || V_FLAG || ''', '''
+                     || main.report_id_seq.nextval || ''')';
+    DBMS_OUTPUT.PUT_LINE(sql_text);
+    EXECUTE IMMEDIATE sql_text;
+    COMMIT;
+  END JOB_CREATE;
+  
+--============================================================================--
+
+--------------------------------------------------------------------------------
+--                Fullfill the task table (feel free to modify)
+--------------------------------------------------------------------------------
+
+  PROCEDURE fullfill_task AS
+    v_task_cnt NUMBER;
+    v_step NUMBER;
+    v_start DATE;
+    v_end DATE;
+    v_part VARCHAR2(1000);
+  BEGIN
+    dbms_output.enable(buffer_size => null);
+    v_task_cnt := 672;
+    v_step := 0;
+    v_start := to_date('20170101 00' , 'yyyymmdd hh24');
+    v_end := to_date('20170208 00' , 'yyyymmdd hh24');
+    WHILE v_start < v_end LOOP
+      v_part := 'CD_' || to_char(v_start, 'yyyymmdd_hh24');
+      
+      dbms_output.put_line(v_part);
+      main.SCHEDULER.job_create(sysdate, 'DATA_STATS_BY_MSISDN', 'DSBM', 'DATA_STATS_BY_MSISDN_P', 'READY', sysdate, sysdate, 'REPORT.DATA_STATS_BY_MSISDN_P(''''' || v_part || ''''')', '-', 0);
+      
+      v_step := v_step + 1;
+      v_start := v_start + 1/24;
+    END LOOP;
+  END; 
+
+
+--============================================================================--
+  
+  FUNCTION CHECK_STATUS(
+              V_REPORT_NAME  IN VARCHAR2,
+              V_REPORT_START IN DATE,
+              V_REPORT_END   IN DATE
+  ) RETURN NUMBER
+  IS
+    v_cnt NUMBER;
+  BEGIN
+    SELECT SUM(DECODE(status, 'DONE', 0, 1)) INTO v_cnt FROM main.cem_task
+     WHERE report_name = V_REPORT_NAME
+       AND report_time BETWEEN v_report_start AND v_report_end;
+    RETURN v_cnt;
+  END;
+  
+--============================================================================--
+  
+  FUNCTION CHECK_STATUS_COUNT (
+              V_REPORT_NAME  IN VARCHAR2,
+              V_REPORT_START IN DATE,
+              V_REPORT_END   IN DATE,
+              V_STATUS       IN VARCHAR2
+  ) RETURN NUMBER  IS
+    v_cnt NUMBER;
+  BEGIN
+    SELECT SUM(DECODE(status, v_status, 1, 0)) INTO v_cnt FROM main.cem_task
+     WHERE report_name = V_REPORT_NAME
+       AND report_time BETWEEN v_report_start AND v_report_end;
+    RETURN v_cnt;
+  END;
+  
+END;
